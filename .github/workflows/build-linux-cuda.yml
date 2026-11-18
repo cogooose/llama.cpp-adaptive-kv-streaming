@@ -1,0 +1,187 @@
+# ==============================================================================
+# 工作流名称: Linux x64 (CUDA 13.1.1, SM120a for 5070Ti, 9850X3D + WebUI)
+#
+# 【本工作流目标】
+#   为 Ubuntu 26.04.01 Desktop (以及 GLIBC >= 2.39 的现代 Linux 发行版) 编译具备
+#   Adaptive KV Streaming V2 特性的 llama.cpp 完整服务端与工具集。
+#   硬件针对 AMD Ryzen 9850X3D + NVIDIA RTX 5070 Ti (Blackwell SM120a) 深度定制。
+#
+# 【关键配置说明】
+#   1. 编译底座: ubuntu-24.04 (GCC 13, GLIBC 2.39, OpenSSL 3) 向下兼容 26.04.01。
+#   2. 工具链: NVIDIA 官方校验源 CUDA 13.1.1 (避开 13.2 已知问题, 兼容 595.xxx 驱动)。
+#   3. GPU 加速: -DCMAKE_CUDA_ARCHITECTURES=120a, -DGGML_CUDA_FA_QUANTS=all,
+#      -DGGML_CUDA_CCCL_VERSION=v3.4.3。
+#   4. CPU 加速: -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON 释放 Zen 5 AVX-512。
+#   5. 绿色便携: RPATH=$ORIGIN 并自带 libcudart.so.13 / libcublas*.so.13, 免装 CUDA Toolkit。
+# ==============================================================================
+
+name: Build Linux (CUDA 13.1.1, SM120a, 9850X3D, WebUI)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    name: Linux x64 (CUDA 13.1.1, SM120a, Full Tools & WebUI)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 步骤 1: 编译内置 WebUI 前端资产
+      - name: Setup Node.js (for WebUI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: tools/ui/package-lock.json
+
+      - name: Build WebUI
+        run: |
+          cd tools/ui
+          npm ci
+          npm run build
+          cd ../..
+
+      # 步骤 2: 安装 GCC 13、OpenSSL 开发库、CMake 3.31.10、Ninja 1.13.0，并配置 8G Swap
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tools and configure swap
+        run: |
+          python -m pip install cmake==3.31.10 ninja==1.13.0
+          sudo apt-get update
+          sudo apt-get install -y gcc-13 g++-13 libssl-dev
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo fallocate -l 8G "${{ runner.temp }}/cuda-build.swap"
+          sudo chmod 600 "${{ runner.temp }}/cuda-build.swap"
+          sudo mkswap "${{ runner.temp }}/cuda-build.swap"
+          sudo swapon "${{ runner.temp }}/cuda-build.swap"
+          free -h
+          df -h .
+
+      # 步骤 3: 从 NVIDIA 官方校验源安装 CUDA 13.1.1 工具链 (带缓存)
+      - name: Cache CUDA 13.1.1 Toolkit
+        id: cache-cuda
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/cuda
+          key: cuda-redist-13.1.1-linux-x86_64-v1
+
+      - name: Install CUDA 13.1.1 Toolkit
+        run: |
+          python3 - <<'EOF'
+          import hashlib, json, os, shutil, tarfile, tempfile, urllib.request
+          from pathlib import Path
+
+          VERSION = "13.1.1"
+          BASE = "https://developer.download.nvidia.com/compute/cuda/redist/"
+          COMPONENTS = ("cuda_cccl", "cuda_crt", "cuda_cudart", "cuda_nvcc", "libcublas", "libnvvm")
+          PLATFORM = "linux-x86_64"
+          dest = (Path(os.environ["RUNNER_TEMP"]) / "cuda").resolve()
+          receipt = dest / "redistributables.json"
+
+          def verify_layout(d):
+              lib64 = d / "lib64"
+              if not lib64.exists() and not lib64.is_symlink():
+                  lib64.symlink_to("lib", target_is_directory=True)
+              for req in ("bin/nvcc", "include/cuda_runtime.h", "nvvm/libdevice/libdevice.10.bc",
+                          "lib64/libcudadevrt.a", "lib64/libcudart_static.a"):
+                  if not (d / req).is_file():
+                      raise RuntimeError(f"Missing CUDA file: {req}")
+
+          if not receipt.exists():
+              dest.mkdir(parents=True, exist_ok=True)
+              manifest = json.loads(urllib.request.urlopen(f"{BASE}redistrib_{VERSION}.json", timeout=120).read())
+              installed = {}
+              for name in COMPONENTS:
+                  entry = manifest[name][PLATFORM]
+                  with tempfile.TemporaryDirectory() as tmp:
+                      arc = Path(tmp) / Path(entry["relative_path"]).name
+                      with urllib.request.urlopen(BASE + entry["relative_path"], timeout=600) as src, arc.open("wb") as out:
+                          shutil.copyfileobj(src, out)
+                      sha = hashlib.sha256(arc.read_bytes()).hexdigest()
+                      if sha != entry["sha256"]:
+                          raise RuntimeError(f"Checksum mismatch for {name}")
+                      unpacked = Path(tmp) / "unpacked"
+                      with tarfile.open(arc) as tf:
+                          tf.extractall(unpacked, filter="data")
+                      roots = list(unpacked.iterdir())
+                      assert len(roots) == 1 and roots[0].is_dir()
+                      for child in roots[0].iterdir():
+                          if child.is_dir():
+                              shutil.copytree(child, dest / child.name, dirs_exist_ok=True, symlinks=True)
+                          elif "license" in child.name.lower():
+                              (dest / "licenses" / name).mkdir(parents=True, exist_ok=True)
+                              shutil.copy2(child, dest / "licenses" / name / child.name)
+                      installed[name] = manifest[name]["version"]
+                  print(f"Installed {name} ({installed[name]})", flush=True)
+              verify_layout(dest)
+              receipt.write_text(json.dumps(installed, indent=2) + "\n")
+          else:
+              verify_layout(dest)
+              print("Using cached CUDA 13.1.1 installation")
+
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"CUDA_PATH={dest}\nCUDAToolkit_ROOT={dest}\n")
+          with open(os.environ["GITHUB_PATH"], "a") as f:
+              f.write(f"{dest / 'bin'}\n")
+          EOF
+
+      # 步骤 4: CMake 配置与编译
+      - name: Configure and Build
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc-13 \
+            -DCMAKE_CXX_COMPILER=g++-13 \
+            -DCMAKE_CUDA_HOST_COMPILER=g++-13 \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_NCCL=OFF \
+            -DCUDAToolkit_ROOT="$CUDA_PATH" \
+            -DCMAKE_CUDA_COMPILER="$CUDA_PATH/bin/nvcc" \
+            -DCMAKE_CUDA_ARCHITECTURES=120a \
+            -DGGML_CUDA_FA_QUANTS=all \
+            -DGGML_CUDA_CCCL_VERSION=v3.4.3 \
+            -DLLAMA_OPENSSL=ON \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TESTS=OFF
+          cmake --build build --parallel "$(nproc)"
+
+      # 步骤 5: 打包绿色便携 tar.gz (自带 CUDA 13.1 运行时库与 $ORIGIN RPATH)
+      - name: Package portable archive
+        run: |
+          mkdir -p dist
+          find build/bin -maxdepth 1 \( -type f -o -type l \) -exec cp -a {} dist/ \;
+          ls -la "$CUDA_PATH"/lib64/libcudart.so* "$CUDA_PATH"/lib64/libcublas.so* "$CUDA_PATH"/lib64/libcublasLt.so*
+          cp -L "$CUDA_PATH"/lib64/libcudart.so.13 dist/
+          cp -L "$CUDA_PATH"/lib64/libcublas.so.13 dist/
+          cp -L "$CUDA_PATH"/lib64/libcublasLt.so.13 dist/
+          cp -f LICENSE AUTHORS dist/ 2>/dev/null || true
+          echo "=== Files in dist ==="
+          ls -lh dist/
+          echo "=== Dynamic library resolution check ==="
+          ldd dist/llama-server dist/libggml-cuda.so || true
+          tar -czvf llama-adaptive-kv-linux-x64-cuda13.1-sm120a.tar.gz -C dist .
+
+      # 步骤 6: 上传构建产物
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-adaptive-kv-linux-x64-cuda13.1-sm120a
+          path: llama-adaptive-kv-linux-x64-cuda13.1-sm120a.tar.gz
