@@ -24,7 +24,7 @@ jobs:
   build-linux:
     name: Linux x64 (CUDA 13.1.1, SM120a, Full Tools & WebUI)
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
@@ -161,7 +161,7 @@ jobs:
             -DLLAMA_BUILD_SERVER=ON \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_TESTS=OFF
-          cmake --build build --parallel "$(nproc)"
+          cmake --build build --parallel 2
 
       # 步骤 5: 打包绿色便携 tar.gz (自带 CUDA 13.1 运行时库与 $ORIGIN RPATH)
       - name: Package portable archive
